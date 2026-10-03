@@ -9,6 +9,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -22,6 +23,12 @@ MAX_PAGE = 300
 MAX_RETRIES = 3
 MAX_WAIT_SECONDS = 60.0
 DEFAULT_CALLS_PER_MINUTE = 30
+# Search is fixed at 30 results/page, pages 1-10, quoted query <=512 characters.
+# https://developers.freshdesk.com/api/#filter_tickets
+SEARCH_PER_PAGE = 30
+MAX_SEARCH_PAGE = 10
+MAX_SEARCH_QUERY_LENGTH = 510
+TICKET_FILTERS = ("new_and_my_open", "watching", "spam", "deleted")
 
 
 @dataclass(frozen=True)
@@ -151,14 +158,14 @@ class FreshdeskClient:
         jitter = min(1.0, max(0.0, self._random())) * 0.2
         return min(MAX_WAIT_SECONDS, base + jitter)
 
-    async def _request_tickets(self, params: dict[str, Any]) -> httpx.Response:
+    async def _request_tickets(self, params: dict[str, Any], *, path: str = "tickets") -> httpx.Response:
         # Never expose upstream bodies, URLs, or exception text in public failures.
         for attempt in range(MAX_RETRIES + 1):
             await self._acquire_slot()
             failure = None
             response = None
             try:
-                response = await self._http.get("tickets", params=params)
+                response = await self._http.get(path, params=params)
             except httpx.TimeoutException:
                 failure = ("timeout", "Freshdesk request timed out.")
             except httpx.RequestError:
@@ -177,8 +184,8 @@ class FreshdeskClient:
                 assert failure is not None
                 raise FreshdeskError(*failure, retryable=True, retry_after_seconds=delay)
 
-    async def _ticket_page(self, params: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-        response = await self._request_tickets(params)
+    async def _read_json(self, path: str, params: dict[str, Any]) -> tuple[Any, bool]:
+        response = await self._request_tickets(params, path=path)
         if not 200 <= response.status_code < 300:
             codes = {
                 401: ("authentication_failed", "Freshdesk authentication failed (401). Check FRESHDESK_API_KEY."),
@@ -193,9 +200,88 @@ class FreshdeskClient:
             data = response.json()
         except ValueError:
             pass
+        if data is None:
+            raise FreshdeskError("invalid_response", "Freshdesk returned an invalid JSON response.")
+        return data, "next" in response.links
+
+    async def _ticket_page(self, params: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+        data, has_more = await self._read_json("tickets", params)
         if not isinstance(data, list) or any(not isinstance(ticket, dict) for ticket in data):
             raise FreshdeskError("invalid_response", "Freshdesk returned an invalid ticket-list response.")
-        return data, "next" in response.links
+        return data, has_more
+
+    async def list_tickets_page(self, *, page: int = 1, per_page: int = 30,
+                                filter: str | None = None, updated_since: str | None = None,
+                                include_description: bool = False) -> tuple[list[dict[str, Any]], bool]:
+        """Read one page; the existing list_tickets method remains an aggregate."""
+        if type(page) is not int or not 1 <= page <= MAX_PAGE or type(per_page) is not int or not 1 <= per_page <= MAX_PER_PAGE:
+            raise FreshdeskError("invalid_argument", "Invalid ticket pagination arguments.")
+        if filter is not None and filter not in TICKET_FILTERS:
+            raise FreshdeskError("invalid_argument", "Unsupported ticket filter.")
+        if type(include_description) is not bool:
+            raise FreshdeskError("invalid_argument", "include_description must be a boolean.")
+        if updated_since is not None:
+            valid = False
+            if isinstance(updated_since, str):
+                try:
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", updated_since):
+                        date.fromisoformat(updated_since)
+                        valid = True
+                    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", updated_since):
+                        datetime.fromisoformat(updated_since)
+                        valid = True
+                except ValueError:
+                    pass
+            if not valid:
+                raise FreshdeskError("invalid_argument", "updated_since must be YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ.")
+        params: dict[str, Any] = {"page": page, "per_page": per_page}
+        if filter is not None:
+            params["filter"] = filter
+        if updated_since is not None:
+            params["updated_since"] = updated_since
+        if include_description:
+            params["include"] = "description"
+        return await self._ticket_page(params)
+
+    async def get_ticket(self, ticket_id: int, *, include_conversations: bool = False) -> dict[str, Any]:
+        if type(ticket_id) is not int or ticket_id <= 0 or type(include_conversations) is not bool:
+            raise FreshdeskError("invalid_argument", "ticket_id must be positive and include_conversations must be boolean.")
+        params = {"include": "conversations"} if include_conversations else {}
+        data, _ = await self._read_json(f"tickets/{ticket_id}", params)
+        if not isinstance(data, dict):
+            raise FreshdeskError("invalid_response", "Freshdesk returned an invalid ticket response.")
+        return data
+
+    async def search_tickets(self, query: str, *, page: int = 1) -> tuple[list[dict[str, Any]], int]:
+        if type(page) is not int or not 1 <= page <= MAX_SEARCH_PAGE:
+            raise FreshdeskError("invalid_argument", "Search page must be between 1 and 10.")
+        valid = isinstance(query, str) and 0 < len(query) <= MAX_SEARCH_QUERY_LENGTH and bool(query.strip())
+        if not valid or any(ord(char) < 32 or ord(char) == 127 or char in '\"\\' for char in query):
+            raise FreshdeskError("invalid_argument", "Search query must be an unquoted expression of at most 510 characters without controls, double quotes, or backslashes.")
+        # Check wrapper safety and balanced grouping; Freshdesk validates field semantics.
+        depth = 0
+        in_string = False
+        for char in query:
+            if char == "'":
+                in_string = not in_string
+            elif not in_string:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth < 0:
+                        valid = False
+        if in_string or depth != 0 or not re.search(r"[A-Za-z_][A-Za-z0-9_]*:", query):
+            valid = False
+        if not valid:
+            raise FreshdeskError("invalid_argument", "Search query must contain a field condition and balanced quotes and parentheses.")
+        data, _ = await self._read_json("search/tickets", {"query": f'"{query}"', "page": page})
+        if (not isinstance(data, dict) or type(data.get("total")) is not int or data["total"] < 0
+                or not isinstance(data.get("results"), list)
+                or any(not isinstance(ticket, dict) for ticket in data["results"])
+                or len(data["results"]) > SEARCH_PER_PAGE):
+            raise FreshdeskError("invalid_response", "Freshdesk returned an invalid search response.")
+        return data["results"], data["total"]
 
     async def startup_check(self) -> None:
         """Check authentication and ticket-read permission with one small GET."""
