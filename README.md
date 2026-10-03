@@ -1,8 +1,9 @@
 # Read-only Freshdesk MCP connector
 
-Stage 3 provides a Python 3.11+ stdio FastMCP server using the official `mcp`
-SDK and the existing HTTP client's bounded retries and rate limiter. Only
-read-only tools are exposed; no write endpoints or seed script are implemented.
+Python 3.11+ stdio FastMCP server using the official `mcp` SDK, pinned to the
+locally tested version **1.30.0**, and the HTTP client's retries and rate limiter.
+Only read-only tools are exposed. Stage 4 adds standalone test setup and demo
+scripts; it does not add connector write methods.
 
 ## Setup
 
@@ -16,6 +17,68 @@ Set `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY` in the process environment.
 `.env.example` contains fictional values only; `.env` is ignored and is
 not loaded automatically. Use only fictional tickets in a test account.
 
+Run all commands from `D:\Games\freshdesk-mcp-connector`. Obtain the key from
+your test account profile and provide it through a secure environment launcher;
+do not paste it into shell history, client configuration, or documentation.
+
+| Environment variable | Meaning / default |
+| --- | --- |
+| `FRESHDESK_DOMAIN` | Required Freshdesk hostname or HTTPS origin; no path/query. |
+| `FRESHDESK_API_KEY` | Required secret; environment only. |
+| `FRESHDESK_CALLS_PER_MINUTE` | Positive integer; default 30 per client instance. |
+| `FRESHDESK_DESCRIPTION_MAX_LENGTH` | 1-100000 characters; default 2000. |
+| `FRESHDESK_ALLOW_SEED` | Unset by default; exactly `1` enables test setup writes. |
+
+## Test Setup and Demo
+
+**Only use a Freshdesk TRIAL or dedicated test account with fictional data.**
+`scripts/seed_tickets.py` is the only writing code. It creates 15 fictional
+tickets with `fictional-demo` tags and reserved `example.com` requester emails.
+Creating a ticket may also create its requester contact. Review notification
+and automation settings first: ticket creation can trigger account automations.
+The script cannot independently prove that an account is a trial account;
+the explicit opt-in is your attestation. Repeated runs create duplicates.
+
+The required requester identity is satisfied with `email`. The script also
+supplies name, subject, description, status, priority, source, and tags.
+Create-ticket fields, defaults, and requester requirements were checked at
+[Create a Ticket](https://developers.freshdesk.com/api/#create_ticket).
+Account-specific required custom fields may cause rejection; these are not
+guessed or bypassed by the script.
+
+```powershell
+$env:FRESHDESK_ALLOW_SEED = "1"
+try {
+    .venv\Scripts\python scripts\seed_tickets.py
+} finally {
+    Remove-Item Env:FRESHDESK_ALLOW_SEED -ErrorAction SilentlyContinue
+}
+.venv\Scripts\python scripts\demo.py
+```
+
+Seeding prints a warning, then compact JSON containing created IDs or a sanitized
+structured error. It waits before each POST, defaults to 30 calls/minute, honors
+lower configured budgets and low remaining-rate headers. Explicit 429 rejection
+permits three retries with integer Retry-After or exponential fallback plus
+jitter; long server waits are split into sleeps of at most 60 seconds without
+retrying early. Stop other account activity to preserve shared API headroom.
+
+The demo launches `python -m freshdesk_mcp.server` with the same interpreter
+through the official SDK stdio client. It lists five tickets, fetches at most
+one additional list page when `has_more` is true, gets the first ticket with
+optional conversations, and searches `tag:'fictional-demo'`. It prints compact
+JSON and an `incomplete` record when `has_more` or `truncated` is true; it does
+not pretend the bounded sample is a full export. Search indexing can lag, so
+newly seeded tickets might not appear immediately. Empty recent listings exit
+with `no_demo_ticket`. Run only where displaying fictional ticket text is safe.
+
+### Live Demo Output (User Placeholder)
+
+**Not run against a live account. No live-account results are asserted here.**
+Replace this placeholder yourself after running the demo on your trial/test
+account. Record date, sanitized output, and observed `has_more`/`truncated`
+flags. Never include credentials or real customer data.
+
 ## MCP Server
 
 Run `.venv\Scripts\python -m freshdesk_mcp.server` from the project root after
@@ -24,6 +87,26 @@ host to launch that Python executable with arguments `-m freshdesk_mcp.server`
 and supply credentials through its environment. Stdout is reserved for MCP;
 startup errors are fixed structured JSON on stderr with a nonzero exit code.
 Startup validates configuration and calls `startup_check()` before serving.
+
+Example stdio host configuration (adapt the wrapper to your MCP client's schema):
+
+```json
+{
+  "mcpServers": {
+    "freshdesk": {
+      "command": "D:\\Games\\freshdesk-mcp-connector\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "freshdesk_mcp.server"],
+      "cwd": "D:\\Games\\freshdesk-mcp-connector"
+    }
+  }
+}
+```
+
+The host must inherit or securely inject the required environment variables
+into its child process. This snippet deliberately contains no credentials and
+does not assume environment-substitution syntax supported by every host.
+See [Capabilities](docs/CAPABILITIES.md), [Design](docs/DESIGN.md), and
+[Tool specification](docs/mcp_tool_spec.json).
 
 - `list_tickets(page=1, per_page=30, filter=None, updated_since=None, include_description=False)`
   returns one page, not the client's aggregate list. Allowed filters are
@@ -142,8 +225,18 @@ asyncio.run(main())
 - Sleep, random source, and monotonic clock are injectable. Tests inject a
   fake clock advanced by fake sleep, with no real waiting. Production uses
   asyncio.sleep, random.random, and time.monotonic.
-- Only future `scripts/seed_tickets.py`, explicitly marked test setup, may write
-  to Freshdesk. The connector remains read-only.
+- Only `scripts/seed_tickets.py`, explicitly marked test setup, writes to
+  Freshdesk. The connector remains read-only. Unlike idempotent connector GETs,
+  seed POSTs are not replayed after 5xx, transport failures, or malformed success
+  responses: creation may have succeeded. Inspect the account before rerunning;
+  the script stops without rollback and may have already created some tickets.
+  This is a deliberate test-setup exception to the GET retry policy.
+- Seed pacing is sequential and conservative, not a distributed account-wide
+  limiter. It honors the full seed Retry-After, whereas the unchanged connector
+  caps its retry delay at 60 seconds. Neither process controls other API users.
+- The demo is a bounded sample, not an export: it fetches at most two list pages
+  and one search page. `truncated` cannot recover already-clipped text. Printed
+  ticket text remains untrusted data and must never be executed as instructions.
 
 Rate-limit behavior was checked against https://developers.freshdesk.com/api/#rate-limit:
 trial accounts default to 50 calls/minute; limits apply account-wide, other apps
@@ -181,3 +274,9 @@ concurrent calls, and credential exclusion across retry paths.
 MCP integration tests invoke all three tools through the SDK's in-memory
 ClientSession with mocked HTTP, including startup, schema validation,
 pagination, API failures, output redaction, and session survival.
+Script tests exercise fictional POST payloads, opt-in, pacing, 429 delays,
+ambiguous creation failures, and demo tool calls through an in-memory SDK
+session, plus a real stdio child process whose HTTP transport is mocked. These
+tests do not create real tickets or prove live-account connectivity.
+Run `python -m pytest -q -p no:cacheprovider` with `.venv\Scripts`
+on PATH (or use the explicit interpreter command in Setup).
