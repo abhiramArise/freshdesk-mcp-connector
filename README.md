@@ -13,7 +13,7 @@ python -m venv .venv
 .venv\Scripts\python -m pytest -q -p no:cacheprovider
 ```
 
-Set `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY` in the process environment.
+For real-account operation, set `FRESHDESK_DOMAIN` and `FRESHDESK_API_KEY` in the process environment.
 `.env.example` contains fictional values only; `.env` is ignored and is
 not loaded automatically. Use only fictional tickets in a test account.
 
@@ -72,9 +72,49 @@ not pretend the bounded sample is a full export. Search indexing can lag, so
 newly seeded tickets might not appear immediately. Empty recent listings exit
 with `no_demo_ticket`. Run only where displaying fictional ticket text is safe.
 
+### Credential-Free Mock Demo
+
+```powershell
+.venv\Scripts\python scripts\demo.py --mock
+```
+
+`--mock` always selects mock mode, even if real credentials are present. With
+`FRESHDESK_API_KEY` unset or blank, `scripts/demo.py` defaults to mock mode.
+The real MCP server still requires credentials; this automatic selection is
+limited to the demo script. With a nonblank key and no flag, the unchanged
+real-account demo path is selected and normal domain validation applies.
+
+At startup and in its final summary the demo prints:
+`MOCK MODE: fictional data, no live Freshdesk account`.
+It launches the same MCP server factory over stdio in a child process with an
+injected `httpx.MockTransport`. No local port is opened, no HTTP socket is used,
+and unknown routes return a fake 404 instead of falling back to a network call.
+The child receives only fictional Freshdesk environment values; it does not
+receive the caller's account credentials. `*.freshdesk.com` validation is
+unchanged: mock requests use a valid fictional hostname, not a localhost
+allowlist exception.
+
+The fixture serves ten fictional tickets with varied standard statuses and
+priorities, list next-Link headers, embedded conversations and a conversation
+route, and search results. The first search attempt returns 429 with integer
+`Retry-After: 1`; the existing client retries it. Virtual sleep and clock advance
+the retry/limiter without real waits. Mock descriptions are clipped at 80
+characters to demonstrate `truncated`. A final `get_ticket(999)` intentionally
+returns 200 `text/html`; the demo displays the expected structured
+`invalid_response`, then completes successfully. These are deliberately selected
+test scenarios, not a general Freshdesk emulator or proof of account behavior.
+
+## Live verification status
+
+**User-reported history:** Live verification against a Freshdesk account was
+attempted and was not completed because the API key available at the time was
+rejected with **401**. This report is not evidence of a successful live run.
+All behavior rests on the referenced documentation and mocked tests. No live
+account was contacted while implementing or verifying mock mode.
+
 ### Live Demo Output (User Placeholder)
 
-**Not run against a live account. No live-account results are asserted here.**
+**No completed live demo. No successful live-account results are asserted here.**
 Replace this placeholder yourself after running the demo on your trial/test
 account. Record date, sanitized output, and observed `has_more`/`truncated`
 flags. Never include credentials or real customer data.
@@ -237,6 +277,12 @@ asyncio.run(main())
 - The demo is a bounded sample, not an export: it fetches at most two list pages
   and one search page. `truncated` cannot recover already-clipped text. Printed
   ticket text remains untrusted data and must never be executed as instructions.
+- Mock mode uses an in-process HTTP transport in the stdio child rather than a
+  localhost HTTP server. Fictional environment values are supplied only to the
+  child, with no changes to the parent's environment or the client's allowlist.
+  The mock's virtual time skips wall-clock waits but still exercises the normal
+  retry and limiter logic. The HTML case is expected failure data, not a failed
+  demo; unexpected errors still produce a failed summary/nonzero exit status.
 
 Rate-limit behavior was checked against https://developers.freshdesk.com/api/#rate-limit:
 trial accounts default to 50 calls/minute; limits apply account-wide, other apps
@@ -278,5 +324,8 @@ Script tests exercise fictional POST payloads, opt-in, pacing, 429 delays,
 ambiguous creation failures, and demo tool calls through an in-memory SDK
 session, plus a real stdio child process whose HTTP transport is mocked. These
 tests do not create real tickets or prove live-account connectivity.
+Mock-demo tests cover explicit/automatic selection, stdio execution without
+credentials, pagination, conversations, a retried 429, HTML rejection, and
+unchanged real-account domain validation.
 Run `python -m pytest -q -p no:cacheprovider` with `.venv\Scripts`
 on PATH (or use the explicit interpreter command in Setup).

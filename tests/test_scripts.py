@@ -215,10 +215,83 @@ async def test_seed_invalid_domain_makes_no_request(monkeypatch, runtime):
     assert not calls
 
 
-def test_demo_main_missing_key_is_sanitized(monkeypatch, capsys):
+def test_demo_main_missing_key_selects_mock(monkeypatch, capsys):
     monkeypatch.delenv("FRESHDESK_API_KEY")
-    assert demo.main() == 1
+    calls = []
+
+    async def mock_demo():
+        calls.append(True)
+        return 0
+
+    monkeypatch.setattr(demo, "start_mock_demo", mock_demo)
+    assert demo.main([]) == 0
+    assert calls == [True]
+
+
+def test_demo_mock_flag_overrides_credentials(monkeypatch):
+    async def mock_demo():
+        return 0
+
+    async def forbidden_real_demo():
+        raise AssertionError("Real-account path must not be selected")
+
+    monkeypatch.setattr(demo, "start_mock_demo", mock_demo)
+    monkeypatch.setattr(demo, "start_demo", forbidden_real_demo)
+    assert demo.main(["--mock"]) == 0
+
+
+def test_demo_real_path_still_validates_domain(monkeypatch, capsys):
+    monkeypatch.setenv("FRESHDESK_DOMAIN", "http://127.0.0.1")
+    assert demo.main([]) == 1
     assert json.loads(capsys.readouterr().out)["error_code"] == "configuration_error"
+
+
+async def test_demo_mock_end_to_end_without_credentials(monkeypatch, capsys):
+    monkeypatch.delenv("FRESHDESK_API_KEY")
+    monkeypatch.delenv("FRESHDESK_DOMAIN")
+    assert await demo.start_mock_demo() == 0
+    output = capsys.readouterr().out
+    lines = output.splitlines()
+    assert lines[0] == "MOCK MODE: fictional data, no live Freshdesk account"
+    records = [json.loads(line) for line in lines[1:]]
+    assert records[-1]["mode"] == lines[0]
+    assert records[-1]["status"] == "complete"
+    assert {item.get("tool") for item in records} >= {"list_tickets", "get_ticket", "search_tickets"}
+    assert any(item.get("event") == "incomplete" and item["has_more"] for item in records)
+    assert any(item.get("event") == "incomplete" and item["truncated"] for item in records)
+    ticket = next(item["result"] for item in records if item.get("tool") == "get_ticket")
+    assert ticket["conversations"][0]["customer_provided"]["body"]
+    html = next(item for item in records if item.get("event") == "expected_error")
+    assert html["result"]["error_code"] == "invalid_response"
+    assert KEY not in output
+    assert "fictional-mock-key" not in output
+
+
+async def test_demo_mock_transport_is_closed_and_exercises_retries(runtime):
+    transport = demo.build_mock_transport()
+    async with FreshdeskClient(transport=transport, sleep=runtime.sleep,
+                               clock=lambda: runtime.now, random_source=lambda: 0) as client:
+        await client.startup_check()
+        first, has_more = await client.list_tickets_page(per_page=5, include_description=True)
+        assert len(first) == 5 and has_more
+        second, has_more = await client.list_tickets_page(page=2, per_page=5)
+        assert len(second) == 5 and not has_more
+        ticket = await client.get_ticket(1, include_conversations=True)
+        assert ticket["conversations"]
+        found, total = await client.search_tickets("tag:'fictional-demo'")
+        assert len(found) == total == 10
+        assert runtime.waits == [1]
+        with pytest.raises(FreshdeskError) as exc:
+            await client.get_ticket(999)
+        assert exc.value.to_dict()["error_code"] == "invalid_response"
+        with pytest.raises(FreshdeskError) as exc:
+            await client.get_ticket(123456)
+        assert exc.value.to_dict()["error_code"] == "not_found"
+    async with httpx.AsyncClient(transport=demo.build_mock_transport()) as client:
+        response = await client.get("https://example.com/unexpected")
+        assert response.status_code == 404
+        response = await client.get("https://fictional-support.freshdesk.com/api/v2/tickets/1/conversations")
+        assert response.json()[0]["id"] == 101
 
 
 def test_demo_redacts_json_escaped_credentials(monkeypatch, capsys):

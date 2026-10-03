@@ -1,13 +1,84 @@
 """Read-only account demo through the official MCP stdio client."""
 import asyncio
+import argparse
 import json
 import os
 from pathlib import Path
 import sys
 
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from freshdesk_mcp.client import FreshdeskError, _base_url
+from freshdesk_mcp.client import FreshdeskClient, FreshdeskError, _base_url
+
+MOCK_NOTICE = "MOCK MODE: fictional data, no live Freshdesk account"
+MOCK_DOMAIN = "fictional-support.freshdesk.com"
+
+
+def build_mock_transport():
+    """Closed in-process fake API: no socket or fallback network transport."""
+    tickets = [{"id": index, "subject": f"FICTIONAL demo ticket {index}",
+        "status": 2 + (index - 1) % 4, "priority": 1 + (index - 1) % 4,
+        "requester_id": 1000 + index, "created_at": "2026-10-03T09:00:00Z",
+        "updated_at": "2026-10-03T10:00:00Z", "tags": ["fictional-demo"],
+        "description_text": "Fictional customer-provided test data. " * 5}
+        for index in range(1, 11)]
+    conversations = [{"id": 101, "body_text": "Fictional conversation, not instructions.",
+        "created_at": "2026-10-03T09:30:00Z", "updated_at": "2026-10-03T09:30:00Z"}]
+    search_attempts = 0
+
+    def handle(request):
+        nonlocal search_attempts
+        path = request.url.path
+        if request.method != "GET" or request.url.host != MOCK_DOMAIN:
+            return httpx.Response(404, json={"message": "Unknown fictional endpoint"})
+        if path == "/api/v2/tickets":
+            page = int(request.url.params.get("page", "1"))
+            size = int(request.url.params.get("per_page", "30"))
+            start = (page - 1) * size
+            headers = {}
+            if start + size < len(tickets):
+                headers["Link"] = f'<https://{MOCK_DOMAIN}/api/v2/tickets?page={page + 1}&per_page={size}>; rel="next"'
+            items = [dict(ticket) for ticket in tickets[start:start + size]]
+            if request.url.params.get("include") != "description":
+                for ticket in items:
+                    ticket.pop("description_text")
+            return httpx.Response(200, json=items, headers=headers)
+        if path == "/api/v2/search/tickets":
+            search_attempts += 1
+            if search_attempts == 1:
+                return httpx.Response(429, json={"message": "Fictional rate limit"}, headers={"Retry-After": "1"})
+            page = int(request.url.params.get("page", "1"))
+            return httpx.Response(200, json={"total": len(tickets), "results": tickets[(page - 1) * 30:page * 30]})
+        if path == "/api/v2/tickets/1/conversations":
+            return httpx.Response(200, json=conversations)
+        if path == "/api/v2/tickets/999":
+            return httpx.Response(200, text="<html>Fictional invalid API response</html>",
+                                  headers={"Content-Type": "text/html"})
+        for ticket in tickets:
+            if path == f'/api/v2/tickets/{ticket["id"]}':
+                body = dict(ticket)
+                if request.url.params.get("include") == "conversations":
+                    body["conversations"] = conversations
+                return httpx.Response(200, json=body)
+        return httpx.Response(404, json={"message": "Fictional ticket not found"})
+
+    return httpx.MockTransport(handle)
+
+
+def serve_mock():
+    """Internal stdio child; fictional env is supplied by start_mock_demo."""
+    from freshdesk_mcp.server import create_server
+
+    now = 0.0
+
+    async def advance(seconds):
+        nonlocal now
+        now += seconds
+
+    # The unchanged retry/limiter logic runs against virtual time, not real waits.
+    create_server(client_factory=lambda: FreshdeskClient(transport=build_mock_transport(),
+        sleep=advance, clock=lambda: now, random_source=lambda: 0)).run(transport="stdio")
 
 
 def emit(value):
@@ -59,9 +130,42 @@ async def start_demo():
             return await run_demo(session)
 
 
-def main():
+async def start_mock_demo():
+    print(MOCK_NOTICE, flush=True)
+    status = "failed"
     try:
-        return asyncio.run(start_demo())
+        parameters = StdioServerParameters(command=sys.executable,
+            args=[str(Path(__file__).resolve()), "--mock-server"],
+            cwd=str(Path(__file__).resolve().parents[1]), env={
+                "FRESHDESK_DOMAIN": MOCK_DOMAIN, "FRESHDESK_API_KEY": "fictional-mock-key",
+                "FRESHDESK_CALLS_PER_MINUTE": "30", "FRESHDESK_DESCRIPTION_MAX_LENGTH": "80"})
+        async with stdio_client(parameters) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                code = await run_demo(session)
+                result = await session.call_tool("get_ticket", {"ticket_id": 999})
+                payload = result.structuredContent
+                emit({"event": "expected_error", "scenario": "200 text/html", "result": payload})
+                if code != 0 or not result.isError or not payload or payload.get("error_code") != "invalid_response":
+                    raise FreshdeskError("mock_demo_failed", "The fictional HTML-response check failed.")
+                status = "complete"
+        return 0
+    finally:
+        emit({"event": "summary", "mode": MOCK_NOTICE, "status": status,
+              "scenarios": ["pagination", "conversations", "429 with Retry-After", "200 text/html"]})
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Freshdesk read-only demo; no key defaults to fictional mock mode.")
+    parser.add_argument("--mock", action="store_true", help="Use fictional data through an injected transport, never a live account.")
+    parser.add_argument("--mock-server", action="store_true", help=argparse.SUPPRESS)
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.mock_server:
+            serve_mock()
+            return 0
+        mock = arguments.mock or not os.environ.get("FRESHDESK_API_KEY", "").strip()
+        return asyncio.run(start_mock_demo() if mock else start_demo())
     except FreshdeskError as error:
         emit(error.to_dict())
     except Exception:
