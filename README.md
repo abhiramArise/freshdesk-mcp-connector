@@ -1,7 +1,7 @@
 # Read-only Freshdesk client
 
-Stage 1 provides a Python 3.11+ async HTTP client. No MCP tools, retries,
-write endpoints, or seed script are implemented. The official `mcp` SDK
+Stage 2 provides a Python 3.11+ async HTTP client with bounded retries and
+rate limiting. No MCP tools, write endpoints, or seed script are implemented. The official `mcp` SDK
 is declared as a dependency for later stages.
 
 ## Setup
@@ -24,7 +24,8 @@ async def main():
     try:
         async with FreshdeskClient(timeout_seconds=10) as client:
             await client.startup_check()
-            tickets = await client.list_tickets(include_description=True)
+            tickets, truncated = await client.list_tickets(include_description=True)
+            # truncated=True means a next link remained at the page cap.
             # Consume tickets locally; do not log credentials or raw responses.
     except FreshdeskError as error:
         result = error.to_dict()
@@ -35,8 +36,9 @@ asyncio.run(main())
 
 ## Assumptions
 
-- `FRESHDESK_DOMAIN` accepts a hostname or HTTPS origin, with an optional
-  trailing slash. Paths, credentials, queries, fragments, HTTP, and nonstandard
+- `FRESHDESK_DOMAIN` accepts a hostname ending in `.freshdesk.com` or its HTTPS
+  origin, with an optional trailing slash. Bare hostnames imply HTTPS.
+  Paths, credentials, queries, fragments, HTTP, and nonstandard
   ports are rejected. The client appends `/api/v2/`.
 - Startup validation is explicitly called via `startup_check()`; construction
   makes no network request. It checks ticket-read access with `GET /tickets`
@@ -44,18 +46,47 @@ asyncio.run(main())
 - `list_tickets()` aggregates pages from the requested starting page. Defaults
   are page 1 and 30 items per page. It uses the documented next-link signal,
   increments page locally, and never follows a response-provided URL.
-- Freshdesk's ticket endpoint defaults to tickets created in the last 30 days.
-  Older-ticket filters are outside this stage. There is a 300-page API limit;
-  a next link at that limit produces an error rather than partial success.
+- `list_tickets()` returns `(tickets, truncated)`, the smallest extension of
+  the original list return value. `truncated` is True only when a next link
+  remains at `MAX_PAGE` (300); collected tickets are returned without raising
+  a page-cap error or requesting page 301. Callers must unpack the tuple.
+  HTTP and response errors still raise rather than report successful results.
 - All timeout phases default to 10 seconds. Redirects and environment proxy
   inheritance are disabled. Caller-controlled logging must not dump HTTP
   requests, Authorization headers, environment variables, or private httpx state.
 - Errors are raised as `FreshdeskError`; `to_dict()` supplies the required
-  structure. Messages never copy upstream content. `retryable` describes the
-  failure, but this stage performs one attempt only and returns
-  `retry_after_seconds=None`. Retry-After handling and retries are deferred.
+  structure. Messages never copy upstream content. Retry exhaustion returns
+  `retryable=True` and `retry_after_seconds` equal to the final proposed
+  capped retry delay; no sleep occurs after the final attempt. The cooldown is
+  preserved for the next call on the same client, including after exhaustion.
+- Each page request permits three retries (four total attempts) for 429,
+  5xx, timeouts, and connection/transport errors. Other 4xx, malformed bodies,
+  and redirects are not retried. Missing/invalid Retry-After uses 1, 2, 4
+  seconds of exponential backoff; exhaustion reports an 8-second next delay.
+  Retry-After accepts nonnegative integer seconds only. Jitter adds 0-0.2
+  seconds before applying the 60-second cap to the entire wait.
+- `FRESHDESK_CALLS_PER_MINUTE` is a positive integer, default 30. The limiter
+  tracks attempts in a rolling 60-second window, including unsuccessful calls
+  and retries, and serializes admission for concurrent calls on one client.
+  It is per client instance, not shared across processes or account users.
+- Valid finite rate-limit headers are parsed as numbers (Freshdesk examples
+  include decimals). When remaining is at or below max(1, 10% of total), the
+  next call is delayed by 60/max(1, remaining) seconds. Missing or invalid
+  headers are ignored. This threshold and delay are local conservative policy,
+  not a documented Freshdesk algorithm. Retry and limiter deadlines overlap
+  rather than add duplicate waits. A later request may wait for both constraints.
+- Sleep, random source, and monotonic clock are injectable. Tests inject a
+  fake clock advanced by fake sleep, with no real waiting. Production uses
+  asyncio.sleep, random.random, and time.monotonic.
 - Only future `scripts/seed_tickets.py`, explicitly marked test setup, may write
   to Freshdesk. The connector remains read-only.
+
+Rate-limit behavior was checked against https://developers.freshdesk.com/api/#rate-limit:
+trial accounts default to 50 calls/minute; limits apply account-wide, other apps
+consume budget, and description embedding can consume multiple API credits.
+The local 30-request default leaves headroom but cannot guarantee avoidance of
+429, especially with include=description or other account activity. The explicit
+60-second cap takes precedence over larger server Retry-After values.
 
 ## API Reference
 
@@ -64,9 +95,22 @@ on 2026-10-03: API-key Basic authentication with dummy password `X`,
 ticket listing, `include=description`, page/per_page parameters (maximum
 100 items per page), Link-header pagination, and the 300-page ticket limit.
 
+## Limitations
+
+Without `updated_since`, ticket listing returns only tickets created within
+the past **30 days**, rather than the full ticket history. Freshdesk states:
+"By default, only tickets that have been created within the past 30 days will be returned."
+Verified on 2026-10-03 at https://developers.freshdesk.com/api/#list_all_tickets.
+The docs specify `updated_since` for older tickets; this client does
+not expose that filter. Pagination also stops at 300 pages and reports
+`truncated=True` if a next link remains.
+
 ## Tests
 
 Tests use `httpx.MockTransport` and fictional data only, with no live API
 calls. They cover authentication, timeout configuration, description inclusion,
-pagination, startup success, sanitized 401/403/404 errors, timeouts, and
-invalid or missing environment configuration.
+pagination and truncation, startup success, sanitized HTTP/timeout/connection
+errors (both str and repr), malformed responses, pagination limits, and
+invalid or missing environment configuration. Reliability tests cover retries,
+exhaustion, jitter and caps, low-budget headers, sliding-window admission,
+concurrent calls, and credential exclusion across retry paths.
