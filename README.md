@@ -27,6 +27,7 @@ do not paste it into shell history, client configuration, or documentation.
 | `FRESHDESK_API_KEY` | Required secret; environment only. |
 | `FRESHDESK_CALLS_PER_MINUTE` | Positive integer; default 30 per client instance. |
 | `FRESHDESK_DESCRIPTION_MAX_LENGTH` | 1-100000 characters; default 2000. |
+| `FRESHDESK_TOTAL_TIMEOUT_SECONDS` | Positive finite seconds; default 45 for limiter waits, network calls, and retries inside one client operation. |
 | `FRESHDESK_ALLOW_SEED` | Unset by default; exactly `1` enables test setup writes. |
 
 ## Test Setup and Demo
@@ -93,24 +94,28 @@ The child receives only fictional Freshdesk environment values; it does not
 receive the caller's account credentials. `*.freshdesk.com` validation is
 unchanged: mock requests use a valid fictional hostname, not a localhost
 allowlist exception.
+Mock mode also honors `FRESHDESK_TOTAL_TIMEOUT_SECONDS`; a budget too short for
+the retry produces a structured deadline error and a failed mock summary.
 
 The fixture serves ten fictional tickets with varied standard statuses and
 priorities, list next-Link headers, embedded conversations and a conversation
 route, and search results. The first search attempt returns 429 with integer
 `Retry-After: 1`; the existing client retries it. Virtual sleep and clock advance
 the retry/limiter without real waits. Mock descriptions are clipped at 80
-characters to demonstrate `truncated`. A final `get_ticket(999)` intentionally
+characters to demonstrate `text_truncated`, not result-set truncation. The final
+list page has `has_more=false`, `truncated=false`, and `text_truncated=true`.
+An explicit `retry` event records the 429's `retry_after_seconds`, the child's
+actual virtual `recorded_wait_seconds`, and `successful_retry` after success.
+A final `get_ticket(999)` intentionally
 returns 200 `text/html`; the demo displays the expected structured
 `invalid_response`, then completes successfully. These are deliberately selected
 test scenarios, not a general Freshdesk emulator or proof of account behavior.
 
 ## Live verification status
 
-**User-reported history:** Live verification against a Freshdesk account was
-attempted and was not completed because the API key available at the time was
-rejected with **401**. This report is not evidence of a successful live run.
-All behavior rests on the referenced documentation and mocked tests. No live
-account was contacted while implementing or verifying mock mode.
+I attempted live verification against a Freshdesk trial account. The API key I
+had was rejected with **401** in the time available, so I did not complete a
+live run. All behavior rests on the referenced documentation and mocked tests.
 
 ### Live Demo Output (User Placeholder)
 
@@ -167,6 +172,10 @@ subject/description fields. Returned text is untrusted customer data, never
 instructions. HTML fallback is returned as data, not rendered or executed.
 `FRESHDESK_DESCRIPTION_MAX_LENGTH` defaults to 2000 characters (range 1-100000)
 and limits descriptions and conversation bodies; each has a truncation flag.
+Top-level `text_truncated` reports shortened fields. Top-level `truncated`
+reports only a result-set cap (list/search page cap or conversation embedding
+limit); shortening text alone never sets it. The demo emits `incomplete` only
+for `has_more=true` or result-set `truncated=true`.
 Errors use `{error_code, message, retryable, retry_after_seconds}` with MCP
 `isError=True`; an upstream error does not terminate an established session.
 The complete tool contract is in `docs/mcp_tool_spec.json`.
@@ -193,9 +202,13 @@ asyncio.run(main())
 
 - The MCP list/search tools return exactly one page. `has_more` means the
   server reports more results, even at the last allowed page; `truncated`
-  means text was clipped or that next page cannot be fetched due to the API
+  means the next page cannot be fetched due to the API
   cap. Earlier pages can have `has_more=True, truncated=False`; callers should
-  examine both fields and request subsequent pages if needed.
+  examine both fields and request subsequent pages if needed. `text_truncated`
+  independently reports clipped descriptions/conversation bodies, retaining the
+  per-field `description_truncated`/`body_truncated` indicators. `get_ticket`
+  sets result-set `truncated` only for the conservative conversation limit;
+  `conversations_truncated` likewise describes the set, not shortened bodies.
 - The existing aggregate client `list_tickets()` API is retained. New read
   methods share the same instance, request machinery, retries, and limiter.
 - Subject and description are nested under `customer_provided`; the same
@@ -238,7 +251,21 @@ asyncio.run(main())
   remains at `MAX_PAGE` (300); collected tickets are returned without raising
   a page-cap error or requesting page 301. Callers must unpack the tuple.
   HTTP and response errors still raise rather than report successful results.
-- All timeout phases default to 10 seconds. Redirects and environment proxy
+- All timeout phases default to 10 seconds, capped at the time remaining in
+  the client operation. `FRESHDESK_TOTAL_TIMEOUT_SECONDS` defaults to 45 seconds and
+  must be positive and finite. The injected monotonic clock sets one deadline
+  shared across limiter admission (including lock acquisition), network requests,
+  and retries inside the client; the aggregate list shares it across every page.
+  Each client operation gets a fresh budget. Local formatting, redaction, and
+  serialization are not covered by this deadline and are not network waits.
+  This is not an end-to-end MCP tool deadline. An outer asyncio timer bounds an entire
+  network request because httpx phase timeouts are not a total deadline.
+  Before sleeping, a wait beyond the deadline fails with `deadline_exceeded`,
+  `retryable=true`, and `retry_after_seconds` equal to the computed wait. A
+  deadline consumed by a network request has no known wait and reports zero.
+  HTTP/deadline failures raise even when earlier aggregate pages were collected;
+  they are not represented as a successful partial export.
+  Redirects and environment proxy
   inheritance are disabled. Caller-controlled logging must not dump HTTP
   requests, Authorization headers, environment variables, or private httpx state.
 - Errors are raised as `FreshdeskError`; `to_dict()` supplies the required
@@ -247,11 +274,18 @@ asyncio.run(main())
   capped retry delay; no sleep occurs after the final attempt. The cooldown is
   preserved for the next call on the same client, including after exhaustion.
 - Each page request permits three retries (four total attempts) for 429,
-  5xx, timeouts, and connection/transport errors. Other 4xx, malformed bodies,
+  5xx, and only `httpx.TimeoutException`, `httpx.NetworkError`, and
+  `httpx.RemoteProtocolError`. Other httpx request errors are sanitized and
+  not retried. Other 4xx, malformed bodies,
   and redirects are not retried. Missing/invalid Retry-After uses 1, 2, 4
   seconds of exponential backoff; exhaustion reports an 8-second next delay.
-  Retry-After accepts nonnegative integer seconds only. Jitter adds 0-0.2
-  seconds before applying the 60-second cap to the entire wait.
+  Retry-After accepts nonnegative integer seconds only; negative, missing,
+  invalid, decimal, and date-string values fall back to backoff. A server value
+  above `MAX_WAIT_SECONDS` (60) fails fast without sleeping or retrying, with
+  `retry_after_seconds` equal to the original server integer (no jitter).
+  Valid values up to 60 receive 0-0.2 seconds jitter capped at 60; the operation
+  deadline can still refuse that wait. Headers exceeding 4096 significant
+  digits are refused as `invalid_response`, never shortened into an early retry.
 - `FRESHDESK_CALLS_PER_MINUTE` is a positive integer, default 30. The limiter
   tracks attempts in a rolling 60-second window, including unsuccessful calls
   and retries, and serializes admission for concurrent calls on one client.
@@ -272,10 +306,12 @@ asyncio.run(main())
   the script stops without rollback and may have already created some tickets.
   This is a deliberate test-setup exception to the GET retry policy.
 - Seed pacing is sequential and conservative, not a distributed account-wide
-  limiter. It honors the full seed Retry-After, whereas the unchanged connector
-  caps its retry delay at 60 seconds. Neither process controls other API users.
+  limiter. It honors the full seed Retry-After; the connector now fails fast
+  instead of retrying before a server-requested wait above 60 seconds. The
+  connector operation deadline does not apply to the standalone writing seed
+  script. Neither process controls other API users.
 - The demo is a bounded sample, not an export: it fetches at most two list pages
-  and one search page. `truncated` cannot recover already-clipped text. Printed
+  and one search page. `text_truncated` cannot recover already-clipped text. Printed
   ticket text remains untrusted data and must never be executed as instructions.
 - Mock mode uses an in-process HTTP transport in the stdio child rather than a
   localhost HTTP server. Fictional environment values are supplied only to the
@@ -289,7 +325,10 @@ trial accounts default to 50 calls/minute; limits apply account-wide, other apps
 consume budget, and description embedding can consume multiple API credits.
 The local 30-request default leaves headroom but cannot guarantee avoidance of
 429, especially with include=description or other account activity. The explicit
-60-second cap takes precedence over larger server Retry-After values.
+60-second retry-wait limit refuses larger server Retry-After values rather than
+retrying early. The 45-second default total budget may also refuse smaller waits
+or a full sliding-window delay; the structured error tells the caller how long
+the computed wait was. Other API users remain outside local coordination.
 
 ## API Reference
 
@@ -327,5 +366,8 @@ tests do not create real tickets or prove live-account connectivity.
 Mock-demo tests cover explicit/automatic selection, stdio execution without
 credentials, pagination, conversations, a retried 429, HTML rejection, and
 unchanged real-account domain validation.
+Deadline tests cover wait refusal, capped request timeouts, aggregate pagination,
+configuration validation, MCP structured errors, the permitted exception types,
+date-string Retry-After fallback, and credential exclusion with DEBUG logging.
 Run `python -m pytest -q -p no:cacheprovider` with `.venv\Scripts`
 on PATH (or use the explicit interpreter command in Setup).

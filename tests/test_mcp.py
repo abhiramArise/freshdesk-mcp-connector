@@ -91,7 +91,8 @@ async def test_tool_success(name, arguments):
         assert payload["conversations"][0]["customer_provided"]["body_truncated"]
     else:
         assert not payload["has_more"]
-        assert payload["truncated"]
+    assert not payload["truncated"]
+    assert payload["text_truncated"]
     assert len(calls) == 2
 
 
@@ -113,6 +114,7 @@ async def test_pagination(name, page, has_more, truncated, monkeypatch):
         payload = unpack(await session.call_tool(name, arguments))
     assert payload["has_more"] == has_more
     assert payload["truncated"] == truncated
+    assert not payload["text_truncated"]
     assert len(calls) == 2
 
 
@@ -251,6 +253,7 @@ async def test_description_missing_unknown_labels_and_conversation_cap():
     assert payload["ticket"]["customer_provided"]["description"] is None
     assert payload["conversations_has_more"]
     assert payload["truncated"]
+    assert not payload["text_truncated"]
 
 
 @pytest.mark.parametrize("status,code", [(401, "authentication_failed"), (403, "access_denied")])

@@ -9,17 +9,24 @@ username and `X` is a dummy password
 Freshdesk origin, disables redirects/proxy inheritance, and uses HTTP timeouts.
 This simple single-account test setup is not a credential lifecycle solution.
 
-The existing client retries only 429, 5xx, and transport failures, at most three
-times. Integer Retry-After or exponential backoff receives small jitter and a
-60-second wait cap. Every attempt enters a sliding-window limiter; low-budget
+The client retries only 429, 5xx, and httpx timeout/network/remote-protocol
+failures, at most three times. Integer Retry-After or exponential backoff receives
+small jitter and a 60-second wait cap; server values above 60 fail fast with
+their original value rather than retrying early. Every attempt enters a sliding-window limiter; low-budget
 headers add cooldown. Missing/invalid headers are ignored. These are local
 policies; [Freshdesk rate limits](https://developers.freshdesk.com/api/#rate-limit)
-are account-wide and include other applications. There is no overall per-call
-time budget. The seed script separately paces POSTs and does not replay uncertain
-creation outcomes; see README Assumptions. Connector behavior is unchanged.
+are account-wide and include other applications. Each client operation has a shared
+45-second default deadline, configured by `FRESHDESK_TOTAL_TIMEOUT_SECONDS`.
+Injected-clock checks refuse over-budget sleeps, and remaining-budget httpx
+timeouts plus an outer asyncio timer bound requests. Aggregate pages share the
+same deadline. It bounds limiter waits, network calls, and retries inside the
+client, not an end-to-end MCP tool operation. Local formatting, redaction, and
+serialization are not covered by it and are not network waits.
+The seed script separately paces POSTs and does not replay
+uncertain creation outcomes; see README Assumptions.
 
 `server.py` marks all ticket/conversation text `customer_provided`, clips long
-bodies, redacts echoed credentials, and warns in every tool description that
+bodies (`text_truncated` is separate from result-set `truncated`), redacts echoed credentials, and warns in every tool description that
 text is untrusted data, never instructions. It returns structured sanitized
 errors instead of exposing upstream exception details. Consumers must maintain
 that boundary; tool annotations alone do not make customer text trustworthy.
@@ -34,7 +41,7 @@ These are proposed requirements, not implemented or tested capabilities:
   Freshworks documents [app OAuth setup](https://developers.freshworks.com/docs/tutorials/intermediate/request-method/setup-oauth/).
 - Store and rotate secrets with a secrets manager; isolate tenant credentials.
 - Coordinate limits per tenant/account across processes and budget embedded
-  API credits; add overall deadlines and operational monitoring.
+  API credits; tune the existing deadlines and add operational monitoring.
 - Add audit logging of permitted operation metadata and outcomes, never keys,
   Authorization headers, raw bodies, or customer text by default.
 - Prefer authenticated, replay-protected event delivery over repeated polling.
@@ -42,4 +49,6 @@ These are proposed requirements, not implemented or tested capabilities:
   or [Freshworks ticket product events](https://developers.freshworks.com/docs/app-sdk/v3.0/support_ticket/serverless-apps/product-events/)
   with idempotent consumers and documented account/plan requirements.
 
-No live-account verification has been performed for this stage.
+I attempted live verification against a Freshdesk trial account, but the API key
+I had was rejected with 401 in the time available. I did not complete a live run;
+all behavior rests on the referenced documentation and mocked tests.

@@ -33,14 +33,29 @@ Implementation evidence: `src/freshdesk_mcp/server.py` registers exactly
   lag a few minutes ([search documentation](https://developers.freshdesk.com/api/#filter_tickets)).
 - Long descriptions and conversation bodies are clipped to
   `FRESHDESK_DESCRIPTION_MAX_LENGTH` (default 2000). `server.py` returns per-text
-  flags and aggregate `truncated`; list/search also return `has_more`. A true
-  flag means the current result is not complete, not permission to infer omitted
-  text. Custom status/priority codes are labeled `Unknown`.
+  flags and top-level `text_truncated`. Separately, `truncated` means only a
+  result set cut short at a page/embedding limit, and list/search return
+  `has_more` for further upstream results. The final page can have
+  `has_more=false`, `truncated=false`, `text_truncated=true`. Conversation-set
+  flags are conservatively true at the ten-item embedding limit. No flag is
+  permission to infer omitted text. Custom status/priority codes are `Unknown`.
 - API capacity is shared with all account users/apps, not reserved for this
   connector. Trial accounts have 50 calls/minute; paid-plan and endpoint limits
   differ, and embedding can spend extra credits. Local limiting defaults to 30
   attempts/minute per instance, not account-wide coordination
   ([rate limits](https://developers.freshdesk.com/api/#rate-limit)).
+- `client.py` enforces a 45-second
+  default total deadline configured by `FRESHDESK_TOTAL_TIMEOUT_SECONDS`,
+  bounding limiter waits, network calls, and retries inside the client.
+  Aggregate listing shares one budget across pages. Local formatting, redaction,
+  and serialization are not covered by this deadline and are not network waits;
+  this is not an end-to-end MCP tool deadline.
+  A refused wait returns structured `deadline_exceeded`
+  with `retryable=true` and its computed delay. An all-digit Retry-After with
+  more than 4096 significant digits (after leading zeros are removed) is rejected
+  as `invalid_response`. Supported server Retry-After values above 60
+  seconds fail fast with the original value, never an early retry. Only timeout,
+  network and remote-protocol httpx exceptions are retried, plus 429/5xx statuses.
 - Access requires a valid account API key and ticket-read permissions. Freshdesk
   says API access follows the user's profile permissions
   ([authentication](https://developers.freshdesk.com/api/#authentication)).

@@ -144,7 +144,8 @@ def create_server(*, client_factory: Callable[[], FreshdeskClient] = FreshdeskCl
                                                           updated_since=updated_since, include_description=include_description)
         compact = [_compact_ticket(server._redact(ticket), limit) for ticket in tickets]
         return {"tickets": compact, "has_more": has_more,
-                "truncated": (has_more and page == MAX_PAGE) or any(ticket["customer_provided"]["description_truncated"] for ticket in compact)}
+                "truncated": has_more and page == MAX_PAGE,
+                "text_truncated": any(ticket["customer_provided"]["description_truncated"] for ticket in compact)}
 
     @server.tool(description="Read a ticket, optionally embedding up to ten conversations. " + UNTRUSTED_NOTE, annotations=annotations)
     async def get_ticket(ticket_id: Annotated[int, Field(gt=0)], ctx: Context, include_conversations: bool = False) -> dict[str, Any]:
@@ -152,7 +153,8 @@ def create_server(*, client_factory: Callable[[], FreshdeskClient] = FreshdeskCl
         raw = await client.get_ticket(ticket_id, include_conversations=include_conversations)
         raw = server._redact(raw)
         compact = _compact_ticket(raw, limit)
-        result = {"ticket": compact, "truncated": compact["customer_provided"]["description_truncated"]}
+        result = {"ticket": compact, "truncated": False,
+                  "text_truncated": compact["customer_provided"]["description_truncated"]}
         if include_conversations:
             conversations = raw.get("conversations", [])
             if not isinstance(conversations, list) or any(not isinstance(item, dict) for item in conversations):
@@ -165,8 +167,9 @@ def create_server(*, client_factory: Callable[[], FreshdeskClient] = FreshdeskCl
                               "customer_provided": {"body": body[:limit] if body is not None else None,
                                                     "body_truncated": body is not None and len(body) > limit}})
             result.update(conversations=items, conversations_has_more=len(conversations) >= 10,
-                          conversations_truncated=len(conversations) >= 10 or any(item["customer_provided"]["body_truncated"] for item in items))
+                          conversations_truncated=len(conversations) >= 10)
             result["truncated"] |= result["conversations_truncated"]
+            result["text_truncated"] |= any(item["customer_provided"]["body_truncated"] for item in items)
         return result
 
     @server.tool(description="Search tickets with an unquoted Freshdesk field expression; 30 results/page, pages 1-10. " + UNTRUSTED_NOTE, annotations=annotations)
@@ -177,7 +180,8 @@ def create_server(*, client_factory: Callable[[], FreshdeskClient] = FreshdeskCl
         compact = [_compact_ticket(server._redact(ticket), limit) for ticket in tickets]
         has_more = total > page * SEARCH_PER_PAGE
         return {"tickets": compact, "total": total, "has_more": has_more,
-                "truncated": (has_more and page == MAX_SEARCH_PAGE) or any(ticket["customer_provided"]["description_truncated"] for ticket in compact)}
+                "truncated": has_more and page == MAX_SEARCH_PAGE,
+                "text_truncated": any(ticket["customer_provided"]["description_truncated"] for ticket in compact)}
 
     return server
 

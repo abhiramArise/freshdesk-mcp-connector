@@ -24,6 +24,7 @@ def credentials(monkeypatch):
     monkeypatch.setenv("FRESHDESK_DOMAIN", "fictional-support.freshdesk.com")
     monkeypatch.setenv("FRESHDESK_API_KEY", KEY)
     monkeypatch.delenv("FRESHDESK_ALLOW_SEED", raising=False)
+    monkeypatch.delenv("FRESHDESK_TOTAL_TIMEOUT_SECONDS", raising=False)
 
 
 async def test_seed_refuses_without_opt_in(runtime):
@@ -258,13 +259,21 @@ async def test_demo_mock_end_to_end_without_credentials(monkeypatch, capsys):
     assert records[-1]["status"] == "complete"
     assert {item.get("tool") for item in records} >= {"list_tickets", "get_ticket", "search_tickets"}
     assert any(item.get("event") == "incomplete" and item["has_more"] for item in records)
-    assert any(item.get("event") == "incomplete" and item["truncated"] for item in records)
+    assert all(item["has_more"] or item["truncated"] for item in records if item.get("event") == "incomplete")
+    lists = [item["result"] for item in records if item.get("tool") == "list_tickets" and "result" in item]
+    assert not lists[1]["has_more"] and not lists[1]["truncated"] and lists[1]["text_truncated"]
+    retry = next(item for item in records if item.get("event") == "retry")
+    assert retry == {"event": "retry", "scenario": "429", "retry_after_seconds": 1,
+        "recorded_wait_seconds": 1, "successful_retry": True}
     ticket = next(item["result"] for item in records if item.get("tool") == "get_ticket")
     assert ticket["conversations"][0]["customer_provided"]["body"]
     html = next(item for item in records if item.get("event") == "expected_error")
     assert html["result"]["error_code"] == "invalid_response"
     assert KEY not in output
     assert "fictional-mock-key" not in output
+    description = next(ticket for ticket in lists[1]["tickets"] if ticket["id"] == 8)["customer_provided"]["description"]
+    assert "data. Fictional" in description
+    assert "data.Fictional" not in description
 
 
 async def test_demo_mock_transport_is_closed_and_exercises_retries(runtime):
@@ -278,6 +287,8 @@ async def test_demo_mock_transport_is_closed_and_exercises_retries(runtime):
         assert len(second) == 5 and not has_more
         ticket = await client.get_ticket(1, include_conversations=True)
         assert ticket["conversations"]
+        eighth = await client.get_ticket(8)
+        assert eighth["description_text"] == " ".join(["Fictional customer-provided test data."] * 5)
         found, total = await client.search_tickets("tag:'fictional-demo'")
         assert len(found) == total == 10
         assert runtime.waits == [1]
@@ -301,3 +312,13 @@ def test_demo_redacts_json_escaped_credentials(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert key not in json.loads(output)["customer_provided"]["description"]
     assert json.dumps(key)[1:-1] not in output
+
+
+def test_mock_honors_configured_deadline(monkeypatch, capsys):
+    monkeypatch.setenv("FRESHDESK_TOTAL_TIMEOUT_SECONDS", "0.5")
+    assert demo.main(["--mock"]) == 1
+    output = capsys.readouterr().out
+    records = [json.loads(line) for line in output.splitlines()[1:]]
+    assert any(item.get("result", {}).get("error_code") == "deadline_exceeded" for item in records)
+    assert any(item.get("event") == "summary" and item["status"] == "failed" for item in records)
+    assert KEY not in output

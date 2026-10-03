@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -10,10 +11,12 @@ from freshdesk_mcp import FreshdeskClient, FreshdeskError
 def credentials(monkeypatch):
     monkeypatch.setenv("FRESHDESK_DOMAIN", "fictional-support.freshdesk.com")
     monkeypatch.setenv("FRESHDESK_API_KEY", "fictional-test-key")
+    monkeypatch.setenv("FRESHDESK_TOTAL_TIMEOUT_SECONDS", "180")
 
 
-@pytest.mark.parametrize("header,expected", [("12", 12.1), (None, 1.1), ("invalid", 1.1), ("1.5", 1.1), ("-1", 1.1), ("999", 60), ("60", 60), ("0", 0.1)])
+@pytest.mark.parametrize("header,expected", [("12", 12.1), (None, 1.1), ("invalid", 1.1), ("1.5", 1.1), ("-1", 1.1), ("Wed, 21 Oct 2015 07:28:00 GMT", 1.1), ("60", 60), ("0", 0.1)])
 async def test_retry_after_then_success(header, expected, runtime, caplog):
+    caplog.set_level(logging.DEBUG)
     calls = []
 
     def handler(request):
@@ -32,6 +35,7 @@ async def test_retry_after_then_success(header, expected, runtime, caplog):
 
 @pytest.mark.parametrize("kind,code", [(429, "rate_limited"), (500, "http_error"), (503, "http_error"), ("timeout", "timeout"), ("connection", "connection_error")])
 async def test_exhaustion_sanitized(kind, code, runtime, caplog):
+    caplog.set_level(logging.DEBUG)
     calls = []
 
     def handler(request):
@@ -55,12 +59,40 @@ async def test_exhaustion_sanitized(kind, code, runtime, caplog):
     assert exc.value.__context__ is None
 
 
-async def test_exhausted_retry_after_is_set_and_capped(runtime):
+async def test_oversized_retry_after_fails_fast(runtime):
     async with FreshdeskClient(transport=httpx.MockTransport(lambda request: httpx.Response(429, headers={"Retry-After": "1000"}))) as client:
         with pytest.raises(FreshdeskError) as exc:
             await client.list_tickets()
-    assert runtime.waits == [60, 60, 60]
-    assert exc.value.to_dict()["retry_after_seconds"] == 60
+    assert runtime.waits == []
+    assert exc.value.to_dict()["retry_after_seconds"] == 1000
+    assert exc.value.to_dict()["retryable"]
+
+
+@pytest.mark.parametrize("digits", [4096, 4097])
+async def test_retry_after_digit_boundary(digits, runtime, caplog):
+    caplog.set_level(logging.DEBUG)
+    header = "9" * digits
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": header}, text="fictional-test-key")
+
+    async with FreshdeskClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(FreshdeskError) as exc:
+            await client.list_tickets()
+    assert len(calls) == 1
+    assert runtime.waits == []
+    error = exc.value.to_dict()
+    if digits == 4096:
+        assert error["error_code"] == "rate_limited"
+        assert error["retryable"] is True
+        assert error["retry_after_seconds"] == int(header)
+    else:
+        assert error["error_code"] == "invalid_response"
+        assert error["retryable"] is False
+        assert error["retry_after_seconds"] is None
+    assert "fictional-test-key" not in str(exc.value) + repr(exc.value) + caplog.text
 
 
 @pytest.mark.parametrize("kind", [500, 502, "timeout", "connection"])

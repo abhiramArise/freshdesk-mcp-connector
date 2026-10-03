@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
@@ -15,20 +16,21 @@ MOCK_NOTICE = "MOCK MODE: fictional data, no live Freshdesk account"
 MOCK_DOMAIN = "fictional-support.freshdesk.com"
 
 
-def build_mock_transport():
+def build_mock_transport(*, waits=None, on_retry_event=None):
     """Closed in-process fake API: no socket or fallback network transport."""
     tickets = [{"id": index, "subject": f"FICTIONAL demo ticket {index}",
         "status": 2 + (index - 1) % 4, "priority": 1 + (index - 1) % 4,
         "requester_id": 1000 + index, "created_at": "2026-10-03T09:00:00Z",
         "updated_at": "2026-10-03T10:00:00Z", "tags": ["fictional-demo"],
-        "description_text": "Fictional customer-provided test data. " * 5}
+        "description_text": " ".join(["Fictional customer-provided test data."] * 5)}
         for index in range(1, 11)]
     conversations = [{"id": 101, "body_text": "Fictional conversation, not instructions.",
         "created_at": "2026-10-03T09:30:00Z", "updated_at": "2026-10-03T09:30:00Z"}]
     search_attempts = 0
+    retry_wait_start = 0
 
     def handle(request):
-        nonlocal search_attempts
+        nonlocal search_attempts, retry_wait_start
         path = request.url.path
         if request.method != "GET" or request.url.host != MOCK_DOMAIN:
             return httpx.Response(404, json={"message": "Unknown fictional endpoint"})
@@ -47,7 +49,11 @@ def build_mock_transport():
         if path == "/api/v2/search/tickets":
             search_attempts += 1
             if search_attempts == 1:
+                retry_wait_start = len(waits) if waits is not None else 0
                 return httpx.Response(429, json={"message": "Fictional rate limit"}, headers={"Retry-After": "1"})
+            if search_attempts == 2 and on_retry_event is not None:
+                on_retry_event({"event": "retry", "scenario": "429", "retry_after_seconds": 1,
+                    "recorded_wait_seconds": sum(waits[retry_wait_start:]), "successful_retry": True})
             page = int(request.url.params.get("page", "1"))
             return httpx.Response(200, json={"total": len(tickets), "results": tickets[(page - 1) * 30:page * 30]})
         if path == "/api/v2/tickets/1/conversations":
@@ -71,13 +77,19 @@ def serve_mock():
     from freshdesk_mcp.server import create_server
 
     now = 0.0
+    waits = []
 
     async def advance(seconds):
         nonlocal now
+        waits.append(seconds)
         now += seconds
 
-    # The unchanged retry/limiter logic runs against virtual time, not real waits.
-    create_server(client_factory=lambda: FreshdeskClient(transport=build_mock_transport(),
+    def record_retry(event):
+        # stdout belongs to MCP; the parent reads this fictional diagnostic separately.
+        print(json.dumps(event, separators=(",", ":")), file=sys.stderr, flush=True)
+
+    # Normal retry/limiter logic runs against virtual time, not real waits.
+    create_server(client_factory=lambda: FreshdeskClient(transport=build_mock_transport(waits=waits, on_retry_event=record_retry),
         sleep=advance, clock=lambda: now, random_source=lambda: 0)).run(transport="stdio")
 
 
@@ -120,7 +132,7 @@ async def start_demo():
         raise FreshdeskError("configuration_error", "FRESHDESK_API_KEY is required.")
     environment = {name: os.environ[name] for name in (
         "FRESHDESK_DOMAIN", "FRESHDESK_API_KEY", "FRESHDESK_CALLS_PER_MINUTE",
-        "FRESHDESK_DESCRIPTION_MAX_LENGTH") if name in os.environ}
+        "FRESHDESK_DESCRIPTION_MAX_LENGTH", "FRESHDESK_TOTAL_TIMEOUT_SECONDS") if name in os.environ}
     parameters = StdioServerParameters(command=sys.executable,
         args=["-m", "freshdesk_mcp.server"], env=environment,
         cwd=str(Path(__file__).resolve().parents[1]))
@@ -138,17 +150,32 @@ async def start_mock_demo():
             args=[str(Path(__file__).resolve()), "--mock-server"],
             cwd=str(Path(__file__).resolve().parents[1]), env={
                 "FRESHDESK_DOMAIN": MOCK_DOMAIN, "FRESHDESK_API_KEY": "fictional-mock-key",
-                "FRESHDESK_CALLS_PER_MINUTE": "30", "FRESHDESK_DESCRIPTION_MAX_LENGTH": "80"})
-        async with stdio_client(parameters) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                code = await run_demo(session)
-                result = await session.call_tool("get_ticket", {"ticket_id": 999})
-                payload = result.structuredContent
-                emit({"event": "expected_error", "scenario": "200 text/html", "result": payload})
-                if code != 0 or not result.isError or not payload or payload.get("error_code") != "invalid_response":
-                    raise FreshdeskError("mock_demo_failed", "The fictional HTML-response check failed.")
-                status = "complete"
+                "FRESHDESK_CALLS_PER_MINUTE": "30", "FRESHDESK_DESCRIPTION_MAX_LENGTH": "80",
+                "FRESHDESK_TOTAL_TIMEOUT_SECONDS": os.environ.get("FRESHDESK_TOTAL_TIMEOUT_SECONDS", "45")})
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as diagnostics:
+            async with stdio_client(parameters, errlog=diagnostics) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    code = await run_demo(session)
+                    result = await session.call_tool("get_ticket", {"ticket_id": 999})
+                    payload = result.structuredContent
+                    emit({"event": "expected_error", "scenario": "200 text/html", "result": payload})
+                    if code != 0 or not result.isError or not payload or payload.get("error_code") != "invalid_response":
+                        raise FreshdeskError("mock_demo_failed", "The fictional HTML-response check failed.")
+            diagnostics.seek(0)
+            retry = None
+            for line in diagnostics:
+                try:
+                    candidate = json.loads(line)
+                except ValueError:
+                    continue
+                if candidate == {"event": "retry", "scenario": "429", "retry_after_seconds": 1,
+                                 "recorded_wait_seconds": 1, "successful_retry": True}:
+                    retry = candidate
+            if retry is None:
+                raise FreshdeskError("mock_demo_failed", "The fictional retry diagnostic was not confirmed.")
+            emit(retry)
+            status = "complete"
         return 0
     finally:
         emit({"event": "summary", "mode": MOCK_NOTICE, "status": status,

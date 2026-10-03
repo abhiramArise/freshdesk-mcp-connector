@@ -23,6 +23,7 @@ MAX_PAGE = 300
 MAX_RETRIES = 3
 MAX_WAIT_SECONDS = 60.0
 DEFAULT_CALLS_PER_MINUTE = 30
+DEFAULT_TOTAL_TIMEOUT_SECONDS = 45.0
 # Search is fixed at 30 results/page, pages 1-10, quoted query <=512 characters.
 # https://developers.freshdesk.com/api/#filter_tickets
 SEARCH_PER_PAGE = 30
@@ -94,6 +95,14 @@ class FreshdeskClient:
             pass
         if calls_per_minute is None or calls_per_minute <= 0:
             raise FreshdeskError("configuration_error", "FRESHDESK_CALLS_PER_MINUTE must be a positive integer.")
+        try:
+            total_timeout = float(os.environ.get("FRESHDESK_TOTAL_TIMEOUT_SECONDS", str(DEFAULT_TOTAL_TIMEOUT_SECONDS)))
+        except ValueError:
+            total_timeout = 0
+        if not math.isfinite(total_timeout) or total_timeout <= 0:
+            raise FreshdeskError("configuration_error", "FRESHDESK_TOTAL_TIMEOUT_SECONDS must be a positive finite number.")
+        self._total_timeout = total_timeout
+        self._timeout_seconds = timeout_seconds
         self._calls_per_minute = calls_per_minute
         self._sleep = sleep
         self._random = random_source
@@ -120,10 +129,38 @@ class FreshdeskClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _acquire_slot(self) -> None:
+    def _deadline_error(self, wait: float = 0) -> FreshdeskError:
+        return FreshdeskError("deadline_exceeded", "Freshdesk operation exceeded its total time budget.",
+                              retryable=True, retry_after_seconds=wait)
+
+    def _remaining(self, deadline: float) -> float:
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise self._deadline_error()
+        return remaining
+
+    async def _wait(self, wait: float, deadline: float) -> None:
+        remaining = deadline - self._clock()
+        if wait > remaining:
+            raise self._deadline_error(wait)
+        self._remaining(deadline)
+        try:
+            async with asyncio.timeout(remaining):
+                await self._sleep(wait)
+        except TimeoutError:
+            raise self._deadline_error(wait) from None
+        self._remaining(deadline)
+
+    async def _acquire_slot(self, deadline: float) -> None:
         # Serialize admission so concurrent requests share the rolling window.
-        async with self._limiter_lock:
+        try:
+            async with asyncio.timeout(self._remaining(deadline)):
+                await self._limiter_lock.acquire()
+        except TimeoutError:
+            raise self._deadline_error() from None
+        try:
             while True:
+                self._remaining(deadline)
                 now = self._clock()
                 while self._requests and self._requests[0] <= now - MAX_WAIT_SECONDS:
                     self._requests.popleft()
@@ -133,7 +170,9 @@ class FreshdeskClient:
                 if delay <= 0:
                     self._requests.append(now)
                     return
-                await self._sleep(min(MAX_WAIT_SECONDS, delay))
+                await self._wait(delay, deadline)
+        finally:
+            self._limiter_lock.release()
 
     def _read_rate_limit(self, response: httpx.Response) -> None:
         try:
@@ -152,25 +191,40 @@ class FreshdeskClient:
         if response is not None and response.status_code == 429:
             value = response.headers.get("Retry-After", "").strip()
             if re.fullmatch(r"[0-9]+", value):
-                # Bound the string before conversion, including extremely long headers.
                 digits = value.lstrip("0") or "0"
-                base = MAX_WAIT_SECONDS if len(digits) > 2 else min(MAX_WAIT_SECONDS, int(digits))
+                # Refuse malicious unrepresentable headers rather than retry early.
+                if len(digits) > 4096:
+                    raise FreshdeskError("invalid_response", "Freshdesk returned an unsupported Retry-After value.")
+                seconds = int(digits)
+                if seconds > MAX_WAIT_SECONDS:
+                    raise FreshdeskError("rate_limited", "Freshdesk requested a wait longer than the retry wait limit.",
+                                         retryable=True, retry_after_seconds=seconds)
+                base = seconds
         jitter = min(1.0, max(0.0, self._random())) * 0.2
         return min(MAX_WAIT_SECONDS, base + jitter)
 
-    async def _request_tickets(self, params: dict[str, Any], *, path: str = "tickets") -> httpx.Response:
+    async def _request_tickets(self, params: dict[str, Any], *, path: str = "tickets", deadline: float) -> httpx.Response:
         # Never expose upstream bodies, URLs, or exception text in public failures.
         for attempt in range(MAX_RETRIES + 1):
-            await self._acquire_slot()
+            await self._acquire_slot(deadline)
             failure = None
             response = None
             try:
-                response = await self._http.get(path, params=params)
+                remaining = self._remaining(deadline)
+                # httpx timeouts are phase-specific; the outer timer bounds the whole request.
+                async with asyncio.timeout(remaining):
+                    response = await self._http.get(path, params=params,
+                        timeout=httpx.Timeout(min(self._timeout_seconds, remaining)))
+            except TimeoutError:
+                raise self._deadline_error() from None
             except httpx.TimeoutException:
                 failure = ("timeout", "Freshdesk request timed out.")
-            except httpx.RequestError:
+            except (httpx.NetworkError, httpx.RemoteProtocolError):
                 failure = ("connection_error", "Could not connect to Freshdesk.")
+            except httpx.RequestError:
+                raise FreshdeskError("connection_error", "Freshdesk request could not be completed.") from None
             if response is not None:
+                self._remaining(deadline)
                 self._read_rate_limit(response)
                 if response.status_code == 429:
                     failure = ("rate_limited", "Freshdesk rate limit reached (429).")
@@ -184,8 +238,10 @@ class FreshdeskClient:
                 assert failure is not None
                 raise FreshdeskError(*failure, retryable=True, retry_after_seconds=delay)
 
-    async def _read_json(self, path: str, params: dict[str, Any]) -> tuple[Any, bool]:
-        response = await self._request_tickets(params, path=path)
+    async def _read_json(self, path: str, params: dict[str, Any], *, deadline: float | None = None) -> tuple[Any, bool]:
+        if deadline is None:
+            deadline = self._clock() + self._total_timeout
+        response = await self._request_tickets(params, path=path, deadline=deadline)
         if not 200 <= response.status_code < 300:
             codes = {
                 401: ("authentication_failed", "Freshdesk authentication failed (401). Check FRESHDESK_API_KEY."),
@@ -202,10 +258,11 @@ class FreshdeskClient:
             pass
         if data is None:
             raise FreshdeskError("invalid_response", "Freshdesk returned an invalid JSON response.")
+        self._remaining(deadline)
         return data, "next" in response.links
 
-    async def _ticket_page(self, params: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-        data, has_more = await self._read_json("tickets", params)
+    async def _ticket_page(self, params: dict[str, Any], *, deadline: float | None = None) -> tuple[list[dict[str, Any]], bool]:
+        data, has_more = await self._read_json("tickets", params, deadline=deadline)
         if not isinstance(data, list) or any(not isinstance(ticket, dict) for ticket in data):
             raise FreshdeskError("invalid_response", "Freshdesk returned an invalid ticket-list response.")
         return data, has_more
@@ -292,11 +349,12 @@ class FreshdeskClient:
         if type(page) is not int or not 1 <= page <= MAX_PAGE or type(per_page) is not int or not 1 <= per_page <= MAX_PER_PAGE:
             raise FreshdeskError("invalid_argument", f"page must be 1-{MAX_PAGE} and per_page must be 1-{MAX_PER_PAGE}.")
         tickets = []
+        deadline = self._clock() + self._total_timeout
         for current_page in range(page, MAX_PAGE + 1):
             params = {"page": current_page, "per_page": per_page}
             if include_description:
                 params["include"] = "description"
-            batch, has_next = await self._ticket_page(params)
+            batch, has_next = await self._ticket_page(params, deadline=deadline)
             tickets.extend(batch)
             if not has_next:
                 return tickets, False
